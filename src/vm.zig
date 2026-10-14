@@ -1,22 +1,28 @@
 const std = @import("std");
+const Math = @import("math.zig");
 pub const Reg = u32;
 pub const Mach = @This();
 
-const Slot = struct { offset: usize, len: usize };
-const Block = struct { offset: usize, len: usize, slots: []Slot, size: usize };
+const Slot = extern struct { offset: usize, len: usize };
+const Block = struct {
+    offset: usize,
+    len: usize,
+    registers: usize,
+    register_count: usize,
+    size: usize,
+};
 const Frame = struct {
     block: ?u32 = null,
     counter: usize = 0,
     base: usize,
-    slots: []const Slot,
-    callargs: u32 = 0, // Byte offset of resolved u32 pairs in stack.
-    argcount: u32 = 0,
+    callargs: []align(1) const Slot,
 };
 
 alloc: std.mem.Allocator,
 rom: std.ArrayList(u8) = .empty,
 instructions: std.ArrayList(Inst) = .empty,
 blocks: std.ArrayList(Block) = .empty,
+slots: std.ArrayList(Slot) = .empty,
 stack: std.ArrayList(u8) = .empty,
 kstack: std.ArrayList(Frame) = .empty,
 
@@ -29,16 +35,17 @@ pub const Inst = union(enum) {
         eqal = 0x00,
     };
 
-    tmp: struct { u32 },
-    read: struct { s: u32, o: u32, d: Reg },
+    tmp: struct { usize },
+    read: struct { s: usize, o: usize, d: Reg },
 
     arg: struct { i: u32, d: Reg },
-    call: struct { id: u32, d: Reg, args: []const Reg = &.{} },
+    call: struct { id: u32, d: Reg, args: usize = 0, argcount: u32 = 0 },
     ret: Reg,
 
     cpy: Ld,
     mov: Ld,
 
+    lea: Ld,
     add: Lrd,
     sub: Lrd,
     mul: Lrd,
@@ -69,89 +76,89 @@ pub fn init(alloc: std.mem.Allocator) !Mach {
 }
 
 pub fn deinit(this: *Mach) void {
-    for (this.instructions.items) |inst| switch (inst) {
-        .call => |c| this.alloc.free(c.args),
-        else => {},
-    };
-    for (this.blocks.items) |b| this.alloc.free(b.slots);
-    for (this.kstack.items) |f| {
-        if (f.block == null) this.alloc.free(f.slots);
-    }
-    this.blocks.deinit(this.alloc);
     this.rom.deinit(this.alloc);
     this.instructions.deinit(this.alloc);
-    this.kstack.deinit(this.alloc);
+    this.blocks.deinit(this.alloc);
+    this.slots.deinit(this.alloc);
     this.stack.deinit(this.alloc);
+    this.kstack.deinit(this.alloc);
 }
 
-fn layout(allocator: std.mem.Allocator, sizes: []const u32) !struct { slots: []Slot, size: usize } {
-    const slots = try allocator.alloc(Slot, sizes.len);
-    errdefer allocator.free(slots);
+fn extendStack(this: *Mach, bytes: usize) !usize {
+    const base = this.stack.items.len;
+    _ = try std.math.add(usize, base, bytes);
+    const previous = @intFromPtr(this.stack.items.ptr);
+    try this.stack.appendNTimes(this.alloc, 0, bytes);
+    if (@intFromPtr(this.stack.items.ptr) != previous) {
+        for (this.kstack.items) |*frame| {
+            if (frame.callargs.len == 0) continue;
+            const offset = @intFromPtr(frame.callargs.ptr) - previous;
+            frame.callargs = this.descriptors(offset, frame.callargs.len);
+        }
+    }
+    return base;
+}
+
+fn descriptors(this: *Mach, offset: usize, count: usize) []align(1) Slot {
+    return std.mem.bytesAsSlice(Slot, this.stack.items[offset..][0 .. count * @sizeOf(Slot)]);
+}
+
+pub fn pushStack(this: *Mach, sizes: []const usize) !void {
     var size: usize = 0;
-    for (sizes, slots) |len, *slot| {
+    for (sizes) |len| {
         if (len == 0) return error.EmptyRegister;
-        slot.* = .{ .offset = size, .len = len };
         size = try std.math.add(usize, size, len);
     }
-    return .{ .slots = slots, .size = size };
-}
-
-/// Create a caller frame on the VM stack, with register sizes in bytes.
-/// Calls return to these registers; run never returns a host value.
-pub fn pushStack(this: *Mach, sizes: []const u32) !void {
-    const registers = try layout(this.alloc, sizes);
-    errdefer this.alloc.free(registers.slots);
-    const base = this.stack.items.len;
-    try this.stack.appendNTimes(this.alloc, 0, registers.size);
+    const bytes = try std.math.mul(usize, sizes.len, @sizeOf(Slot));
+    const base = try this.extendStack(try std.math.add(usize, size, bytes));
     errdefer this.stack.shrinkRetainingCapacity(base);
-    try this.kstack.append(this.alloc, .{ .base = base, .slots = registers.slots });
+    const locations = this.descriptors(base + size, sizes.len);
+    var offset = base;
+    for (sizes, locations) |len, *descriptor| {
+        descriptor.* = .{ .offset = offset, .len = len };
+        offset += len;
+    }
+    try this.kstack.append(this.alloc, .{ .base = base, .callargs = locations });
 }
 
 pub fn popStack(this: *Mach) !void {
-    if (this.kstack.items.len == 0) return error.NoCallerFrame;
-    const frame = this.kstack.items[this.kstack.items.len - 1];
+    const frame = this.kstack.getLastOrNull() orelse return error.NoCallerFrame;
     if (frame.block != null) return error.ActiveCall;
     _ = this.kstack.pop();
     this.stack.shrinkRetainingCapacity(frame.base);
-    this.alloc.free(frame.slots);
 }
 
-pub fn pushBlock(this: *Mach, instructions: []const Inst) !u32 {
+pub fn pushBlock(this: *Mach, insts: []const Inst) !u32 {
     const id = std.math.cast(u32, this.blocks.items.len) orelse return error.TooManyBlocks;
-    var sizes: std.ArrayList(u32) = .empty;
-    defer sizes.deinit(this.alloc);
-    for (instructions) |inst| switch (inst) {
-        .tmp => |t| try sizes.append(this.alloc, t[0]),
-        else => {},
-    };
-    const registers = try layout(this.alloc, sizes.items);
-    errdefer this.alloc.free(registers.slots);
+    const register_start = this.slots.items.len;
+    errdefer this.slots.shrinkRetainingCapacity(register_start);
+    var size: usize = 0;
+    for (insts) |inst| {
+        if (inst != .tmp) continue;
+        const len = inst.tmp[0];
+        if (len == 0) return error.EmptyRegister;
+        try this.slots.append(this.alloc, .{ .offset = size, .len = len });
+        size = try std.math.add(usize, size, len);
+    }
     const offset = this.instructions.items.len;
-    errdefer {
-        for (this.instructions.items[offset..]) |inst| switch (inst) {
-            .call => |c| this.alloc.free(c.args),
-            else => {},
-        };
-        this.instructions.shrinkRetainingCapacity(offset);
-    }
-    for (instructions) |inst| {
-        var owned = inst;
-        if (inst == .call) owned.call.args = try this.alloc.dupe(Reg, inst.call.args);
-        errdefer if (owned == .call) this.alloc.free(owned.call.args);
-        try this.instructions.append(this.alloc, owned);
-    }
-    try this.blocks.append(this.alloc, .{ .offset = offset, .len = instructions.len, .slots = registers.slots, .size = registers.size });
+    errdefer this.instructions.shrinkRetainingCapacity(offset);
+    try this.instructions.appendSlice(this.alloc, insts);
+    try this.blocks.append(this.alloc, .{
+        .offset = offset,
+        .len = insts.len,
+        .registers = register_start,
+        .register_count = this.slots.items.len - register_start,
+        .size = size,
+    });
     return id;
 }
 
-pub fn pushRomBytes(this: *Mach, bytes: []const u8) !u32 {
-    const offset = std.math.cast(u32, this.rom.items.len) orelse return error.RomTooLarge;
-    _ = std.math.cast(u32, try std.math.add(usize, this.rom.items.len, bytes.len)) orelse return error.RomTooLarge;
+pub fn pushRomBytes(this: *Mach, bytes: []const u8) !usize {
+    const offset = this.rom.items.len;
     try this.rom.appendSlice(this.alloc, bytes);
     return offset;
 }
-
-pub fn pushRom(this: *Mach, value: anytype) !u32 {
+pub fn pushRom(this: *Mach, value: anytype) !usize {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
     if (info != .int or info.int.signedness != .unsigned) @compileError("ROM integers must be unsigned; use pushRomBytes for raw bytes");
@@ -168,67 +175,69 @@ pub fn readFromRom(this: *Mach, dest: Reg, value: anytype) !@FieldType(Inst, "re
     return .{ .s = (@bitSizeOf(@TypeOf(value)) + 7) / 8, .o = try this.pushRom(value), .d = dest };
 }
 
-fn register(this: *Mach, frame_index: usize, reg: Reg) ![]u8 {
-    const frame = this.kstack.items[frame_index];
-    if (reg >= frame.slots.len) return error.InvalidRegister;
-    const slot = frame.slots[reg];
-    return this.stack.items[frame.base + slot.offset ..][0..slot.len];
+pub fn makeCall(this: *Mach, id: u32, dest: Reg, args: []const Reg) !@FieldType(Inst, "call") {
+    const count = std.math.cast(u32, args.len) orelse return error.TooManyArguments;
+    const bytes = try std.math.mul(usize, args.len, @sizeOf(Reg));
+    const offset = this.rom.items.len;
+    try this.rom.appendNTimes(this.alloc, 0, bytes);
+    for (args, 0..) |arg, i| {
+        std.mem.writeInt(Reg, this.rom.items[offset + i * @sizeOf(Reg) ..][0..@sizeOf(Reg)], arg, .little);
+    }
+    return .{ .id = id, .d = dest, .args = offset, .argcount = count };
 }
 
-fn resolve(frame: Frame, reg: Reg) ![2]u32 {
-    if (reg >= frame.slots.len) return error.InvalidRegister;
-    const slot = frame.slots[reg];
-    const offset = std.math.cast(u32, try std.math.add(usize, frame.base, slot.offset)) orelse return error.StackTooLarge;
-    const len = std.math.cast(u32, slot.len) orelse return error.StackTooLarge;
-    _ = std.math.add(u32, offset, len) catch return error.StackTooLarge;
-    return .{ offset, len };
+fn resolve(this: *Mach, frame: Frame, reg: Reg) !Slot {
+    if (frame.block) |id| {
+        const block = this.blocks.items[id];
+        if (reg >= block.register_count) return error.InvalidRegister;
+        const slot = this.slots.items[block.registers + reg];
+        return .{ .offset = frame.base + slot.offset, .len = slot.len };
+    }
+    if (reg >= frame.callargs.len) return error.InvalidRegister;
+    return frame.callargs[reg];
+}
+
+pub fn register(this: *Mach, fi: usize, reg: Reg) ![]u8 {
+    if (fi >= this.kstack.items.len) return error.InvalidFrame;
+    return this.location(try this.resolve(this.kstack.items[fi], reg));
+}
+
+fn location(this: *Mach, slot: Slot) []u8 {
+    return this.stack.items[slot.offset..][0..slot.len];
 }
 
 fn enter(this: *Mach, call: @FieldType(Inst, "call")) !void {
     if (call.id >= this.blocks.items.len) return error.InvalidBlock;
-    const parent = this.kstack.items[this.kstack.items.len - 1];
-    const argcount = std.math.cast(u32, call.args.len) orelse return error.TooManyArguments;
-    const pairs = try std.math.add(usize, call.args.len, 1);
-    const bytes = try std.math.mul(usize, pairs, 2 * @sizeOf(u32));
+    const argbytes = try std.math.mul(usize, call.argcount, @sizeOf(Reg));
+    const argend = try std.math.add(usize, call.args, argbytes);
+    if (argend > this.rom.items.len) return error.InvalidRom;
+    const count = try std.math.add(usize, call.argcount, 1);
+    const bytes = try std.math.mul(usize, count, @sizeOf(Slot));
     const block = this.blocks.items[call.id];
-    const base = this.stack.items.len;
-    const callargs = std.math.cast(u32, try std.math.add(usize, base, block.size)) orelse return error.StackTooLarge;
-    _ = std.math.cast(u32, try std.math.add(usize, callargs, bytes)) orelse return error.StackTooLarge;
-    try this.stack.appendNTimes(this.alloc, 0, try std.math.add(usize, block.size, bytes));
+    const base = try this.extendStack(try std.math.add(usize, block.size, bytes));
     errdefer this.stack.shrinkRetainingCapacity(base);
-    this.writeCallPair(callargs, 0, try resolve(parent, call.d));
-    for (call.args, 0..) |arg, i| this.writeCallPair(callargs, i + 1, try resolve(parent, arg));
-    try this.kstack.append(this.alloc, .{ .block = call.id, .base = base, .slots = block.slots, .callargs = callargs, .argcount = argcount });
-}
-
-fn writeCallPair(this: *Mach, offset: u32, index: usize, pair: [2]u32) void {
-    const bytes = this.stack.items[@as(usize, offset) + index * 8 ..][0..8];
-    std.mem.writeInt(u32, bytes[0..4], pair[0], .little);
-    std.mem.writeInt(u32, bytes[4..8], pair[1], .little);
-}
-
-fn callPair(this: *Mach, frame: Frame, index: usize) [2]u32 {
-    const bytes = this.stack.items[@as(usize, frame.callargs) + index * 8 ..][0..8];
-    return .{ std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u32, bytes[4..8], .little) };
-}
-
-fn callRegister(this: *Mach, frame: Frame, index: usize) []u8 {
-    const pair = this.callPair(frame, index);
-    return this.stack.items[pair[0]..][0..pair[1]];
+    const parent = this.kstack.getLast();
+    const locations = this.descriptors(base + block.size, count);
+    locations[0] = try this.resolve(parent, call.d);
+    for (0..call.argcount) |i| {
+        const encoded = this.rom.items[call.args + i * @sizeOf(Reg) ..][0..@sizeOf(Reg)];
+        locations[i + 1] = try this.resolve(parent, std.mem.readInt(Reg, encoded, .little));
+    }
+    try this.kstack.append(this.alloc, .{ .block = call.id, .base = base, .callargs = locations });
 }
 
 pub fn run(this: *Mach, entry: Inst) !void {
     if (entry != .call) return error.InvalidEntry;
-    if (this.kstack.items.len == 0) return error.NoCallerFrame;
-    const caller_depth = this.kstack.items.len;
-    if (this.kstack.items[caller_depth - 1].block != null) return error.ActiveCall;
+    const parent = this.kstack.getLastOrNull() orelse return error.NoCallerFrame;
+    if (parent.block != null) return error.ActiveCall;
+    const depth = this.kstack.items.len;
     const stackend = this.stack.items.len;
     defer {
-        this.kstack.shrinkRetainingCapacity(caller_depth);
+        this.kstack.shrinkRetainingCapacity(depth);
         this.stack.shrinkRetainingCapacity(stackend);
     }
     try this.enter(entry.call);
-    while (this.kstack.items.len > caller_depth) {
+    while (this.kstack.items.len > depth) {
         const fi = this.kstack.items.len - 1;
         const frame = &this.kstack.items[fi];
         const block = this.blocks.items[frame.block.?];
@@ -240,22 +249,23 @@ pub fn run(this: *Mach, entry: Inst) !void {
             .read => |r| {
                 const end = try std.math.add(usize, r.o, r.s);
                 if (end > this.rom.items.len) return error.InvalidRom;
-                copy(try this.register(fi, r.d), this.rom.items[r.o..end]);
+                Math.copy(try this.register(fi, r.d), this.rom.items[r.o..end]);
             },
             .arg => |a| {
-                if (a.i >= frame.argcount) return error.InvalidArgument;
-                copy(try this.register(fi, a.d), this.callRegister(frame.*, @as(usize, a.i) + 1));
+                const index = @as(usize, a.i) + 1;
+                if (index >= frame.callargs.len) return error.InvalidArgument;
+                Math.copy(try this.register(fi, a.d), this.location(frame.callargs[index]));
             },
             .call => |c| try this.enter(c),
             .ret => |r| {
-                copy(this.callRegister(frame.*, 0), try this.register(fi, r));
+                Math.copy(this.location(frame.callargs[0]), try this.register(fi, r));
                 const base = frame.base;
                 _ = this.kstack.pop();
                 this.stack.shrinkRetainingCapacity(base);
             },
             .jmp3 => |j| {
-                const c: u8 = if (j.r) |r| (try this.register(fi, r))[0] else 0;
-                const target = switch (c) {
+                const comparison = if (j.r) |r| (try this.register(fi, r))[0] else 0;
+                const target = switch (comparison) {
                     0xff => j.less,
                     0 => j.equal,
                     1 => j.more,
@@ -264,215 +274,222 @@ pub fn run(this: *Mach, entry: Inst) !void {
                 if (target >= block.len) return error.InvalidJump;
                 frame.counter = target;
             },
-            .cpy, .mov, .not, .nnot, .bnot => |a| {
-                const source = try this.alloc.dupe(u8, try this.register(fi, a.l));
-                defer this.alloc.free(source);
+            .lea => |a| {
+                const source = try this.resolve(frame.*, a.l);
                 const dest = try this.register(fi, a.d);
-                switch (inst) {
-                    .cpy, .mov => copy(dest, source),
-                    .not, .nnot => {
-                        @memset(dest, 0);
-                        dest[0] = @intFromBool(if (inst == .not) isZero(source) else !isZero(source));
-                    },
-                    .bnot => for (dest, 0..) |*byte, i| {
-                        byte.* = ~at(source, i);
-                    },
-                    else => unreachable,
+                var bytes: [@sizeOf(usize)]u8 = undefined;
+                std.mem.writeInt(usize, &bytes, source.offset, .little);
+                for (bytes[@min(dest.len, bytes.len)..]) |byte| {
+                    if (byte != 0) return error.AddressTooLarge;
                 }
-                if (inst == .mov and a.l != a.d) @memset(try this.register(fi, a.l), 0);
+                Math.copy(dest, &bytes);
             },
-            .add, .sub, .mul, .div, .mod, .cmp, .band, .bor, .bxor, .shl, .shr => |a| {
-                const left = try this.alloc.dupe(u8, try this.register(fi, a.l));
-                defer this.alloc.free(left);
-                const right = try this.alloc.dupe(u8, try this.register(fi, a.r));
-                defer this.alloc.free(right);
-                try this.binary(inst, try this.register(fi, a.d), left, right);
+            .cpy, .mov => |a| {
+                const source = try this.register(fi, a.l);
+                Math.copy(try this.register(fi, a.d), source);
+                if (inst == .mov and a.l != a.d) @memset(source, 0);
+            },
+            inline .not, .nnot, .bnot => |a, tag| {
+                const source = try this.register(fi, a.l);
+                const dest = try this.register(fi, a.d);
+                @field(Math, @tagName(tag))(dest, source);
+            },
+            inline .add, .sub, .mul, .div, .mod, .cmp, .band, .bor, .bxor, .shl, .shr => |a, tag| {
+                try this.binary(fi, a, tag);
             },
         }
     }
 }
 
-fn at(bytes: []const u8, i: usize) u8 {
-    return if (i < bytes.len) bytes[i] else 0;
-}
-fn isZero(bytes: []const u8) bool {
-    for (bytes) |b| {
-        if (b != 0) return false;
+fn binary(this: *Mach, fi: usize, a: Inst.Lrd, comptime op: std.meta.Tag(Inst)) !void {
+    const left_len = (try this.register(fi, a.l)).len;
+    const right_len = (try this.register(fi, a.r)).len;
+    const dest_len = (try this.register(fi, a.d)).len;
+    const remainder_len = if (op == .div or op == .mod)
+        try std.math.add(usize, @max(left_len, right_len), 1)
+    else
+        0;
+    const scratch = try this.extendStack(try std.math.add(usize, dest_len, remainder_len));
+    defer this.stack.shrinkRetainingCapacity(scratch);
+    const left = try this.register(fi, a.l);
+    const right = try this.register(fi, a.r);
+    const result = this.stack.items[scratch..][0..dest_len];
+    if (op == .div or op == .mod) {
+        try @field(Math, @tagName(op))(result, left, right, this.stack.items[scratch + dest_len ..]);
+    } else {
+        @field(Math, @tagName(op))(result, left, right);
     }
-    return true;
-}
-fn copy(dest: []u8, source: []const u8) void {
-    const len = @min(dest.len, source.len);
-    @memmove(dest[0..len], source[0..len]);
-    @memset(dest[len..], 0);
-}
-fn compare(left: []const u8, right: []const u8) std.math.Order {
-    var i = @max(left.len, right.len);
-    while (i > 0) {
-        i -= 1;
-        if (at(left, i) < at(right, i)) return .lt;
-        if (at(left, i) > at(right, i)) return .gt;
-    }
-    return .eq;
-}
-fn subtract(dest: []u8, left: []const u8, right: []const u8) void {
-    var borrow: u16 = 0;
-    for (dest, 0..) |*byte, i| {
-        const l: u16 = at(left, i);
-        const r: u16 = @as(u16, at(right, i)) + borrow;
-        byte.* = @truncate(l + 256 - r);
-        borrow = @intFromBool(l < r);
-    }
-}
-fn binary(this: *Mach, inst: Inst, dest: []u8, left: []const u8, right: []const u8) !void {
-    @memset(dest, 0);
-    switch (inst) {
-        .add => {
-            var carry: u16 = 0;
-            for (dest, 0..) |*byte, i| {
-                const sum = @as(u16, at(left, i)) + at(right, i) + carry;
-                byte.* = @truncate(sum);
-                carry = sum >> 8;
-            }
-        },
-        .sub => subtract(dest, left, right),
-        .mul => {
-            for (left[0..@min(left.len, dest.len)], 0..) |l, i| {
-                var carry: u16 = 0;
-                var j: usize = 0;
-                while (i + j < dest.len) : (j += 1) {
-                    const product = @as(u16, l) * at(right, j) + dest[i + j] + carry;
-                    dest[i + j] = @truncate(product);
-                    carry = product >> 8;
-                }
-            }
-        },
-        .div, .mod => {
-            if (isZero(right)) return error.DivisionByZero;
-            const remainder = try this.alloc.alloc(u8, try std.math.add(usize, @max(left.len, right.len), 1));
-            defer this.alloc.free(remainder);
-            @memset(remainder, 0);
-            var bit = try std.math.mul(usize, left.len, 8);
-            while (bit > 0) {
-                bit -= 1;
-                var carry: u16 = (left[bit / 8] >> @as(u3, @intCast(bit % 8))) & 1;
-                for (remainder) |*byte| {
-                    const v = (@as(u16, byte.*) << 1) | carry;
-                    byte.* = @truncate(v);
-                    carry = v >> 8;
-                }
-                if (compare(remainder, right) != .lt) {
-                    subtract(remainder, remainder, right);
-                    if (inst == .div and bit / 8 < dest.len) dest[bit / 8] |= @as(u8, 1) << @as(u3, @intCast(bit % 8));
-                }
-            }
-            if (inst == .mod) copy(dest, remainder);
-        },
-        .cmp => dest[0] = switch (compare(left, right)) {
-            .lt => 0xff,
-            .eq => 0,
-            .gt => 1,
-        },
-        .band, .bor, .bxor => for (dest, 0..) |*byte, i| {
-            byte.* = switch (inst) {
-                .band => at(left, i) & at(right, i),
-                .bor => at(left, i) | at(right, i),
-                .bxor => at(left, i) ^ at(right, i),
-                else => unreachable,
-            };
-        },
-        .shl, .shr => {
-            const limit = try std.math.mul(usize, if (inst == .shl) dest.len else left.len, 8);
-            var shift: usize = 0;
-            var i = right.len;
-            while (i > 0) {
-                i -= 1;
-                shift = std.math.mul(usize, shift, 256) catch return;
-                shift = std.math.add(usize, shift, right[i]) catch return;
-                if (shift >= limit) return;
-            }
-            for (dest, 0..) |*byte, d| {
-                var b: usize = 0;
-                while (b < 8) : (b += 1) {
-                    const target = try std.math.add(usize, try std.math.mul(usize, d, 8), b);
-                    const source = if (inst == .shl) (if (target >= shift) target - shift else continue) else (std.math.add(usize, target, shift) catch continue);
-                    if (source / 8 < left.len) byte.* |= ((left[source / 8] >> @as(u3, @intCast(source % 8))) & 1) << @as(u3, @intCast(b));
-                }
-            }
-        },
-        else => unreachable,
-    }
+    Math.copy(try this.register(fi, a.d), result);
 }
 
-test "call frame stores resolved u32 return and argument locations" {
+test "nested calls keep ROM immutable and caller descriptors valid across growth" {
     var mach = try init(std.testing.allocator);
     defer mach.deinit();
-    try mach.pushStack(&.{4});
-    try mach.pushStack(&.{ 1, 2, 4 });
-    const block = try mach.pushBlock(&.{ .{ .tmp = .{4} }, .{ .ret = 0 } });
-    try mach.enter(.{ .id = block, .d = 1, .args = &.{ 2, 0 } });
-    const frame = mach.kstack.items[2];
-    try std.testing.expectEqual(@as(u32, 15), frame.callargs);
-    try std.testing.expectEqual(@as(u32, 2), frame.argcount);
-    try std.testing.expectEqual([2]u32{ 5, 2 }, mach.callPair(frame, 0));
-    try std.testing.expectEqual([2]u32{ 7, 4 }, mach.callPair(frame, 1));
-    try std.testing.expectEqual([2]u32{ 4, 1 }, mach.callPair(frame, 2));
-    // Stack growth does not invalidate the stored offsets.
-    try mach.stack.appendNTimes(mach.alloc, 0, 1024);
-    copy(try mach.register(1, 2), &.{ 1, 2, 3, 4 });
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, mach.callRegister(mach.kstack.items[2], 1));
-}
-
-fn resolvedCallScenario(allocator: std.mem.Allocator) !void {
-    var mach = try init(allocator);
-    defer mach.deinit();
-    try mach.pushStack(&.{4});
-    try mach.pushStack(&.{ 1, 2, 4 });
-    copy(try mach.register(1, 0), &.{3});
-    copy(try mach.register(1, 2), &.{ 255, 1, 2, 3 });
-    const child = try mach.pushBlock(&.{
-        .{ .tmp = .{4} },                        .{ .tmp = .{1} },
-        .{ .arg = .{ .i = 0, .d = 0 } },         .{ .arg = .{ .i = 1, .d = 1 } },
-        .{ .add = .{ .l = 0, .r = 1, .d = 0 } }, .{ .ret = 0 },
+    try mach.pushStack(&.{ 3, 17 });
+    const host_end = mach.stack.items.len;
+    const leaf = try mach.pushBlock(&.{
+        .{ .tmp = .{17} },
+        .{ .arg = .{ .i = 0, .d = 0 } },
+        .{ .ret = 0 },
     });
-    const parent = try mach.pushBlock(&.{
-        .{ .tmp = .{4} },                                          .{ .tmp = .{1} },
-        .{ .arg = .{ .i = 0, .d = 0 } },                           .{ .arg = .{ .i = 1, .d = 1 } },
-        .{ .call = .{ .id = child, .d = 0, .args = &.{ 0, 1 } } }, .{ .ret = 0 },
-    });
-    try mach.run(.{ .call = .{ .id = parent, .d = 1, .args = &.{ 2, 0 } } });
-    try std.testing.expectEqualSlices(u8, &.{ 2, 2 }, try mach.register(1, 1));
-    try std.testing.expectEqual(@as(usize, 2), mach.kstack.items.len);
-    try std.testing.expectEqual(@as(usize, 11), mach.stack.items.len);
-    const bad = try mach.pushBlock(&.{
-        .{ .tmp = .{1} }, .{ .arg = .{ .i = 1, .d = 0 } }, .{ .ret = 0 },
-    });
-    if (mach.run(.{ .call = .{ .id = bad, .d = 1, .args = &.{0} } })) {
-        return error.TestExpectedError;
-    } else |err| {
-        if (err == error.OutOfMemory) return err;
-        try std.testing.expectEqual(error.InvalidArgument, err);
+    var child = leaf;
+    for (0..128) |_| {
+        child = try mach.pushBlock(&.{
+            .{ .tmp = .{17} },
+            .{ .tmp = .{1} },
+            .{ .arg = .{ .i = 0, .d = 0 } },
+            .{ .read = try mach.readFromRom(1, @as(u8, 1)) },
+            .{ .call = try mach.makeCall(child, 0, &.{0}) },
+            .{ .add = .{ .l = 0, .r = 1, .d = 0 } },
+            .{ .ret = 0 },
+        });
     }
-    try std.testing.expectEqual(@as(usize, 2), mach.kstack.items.len);
-    try std.testing.expectEqual(@as(usize, 11), mach.stack.items.len);
+    Math.copy(try mach.register(0, 0), &.{ 255, 0, 0 });
+    const call = try mach.makeCall(child, 1, &.{0});
+    const rom_before = try std.testing.allocator.dupe(u8, mach.rom.items);
+    defer std.testing.allocator.free(rom_before);
+    for (0..2) |_| {
+        try mach.run(.{ .call = call });
+        try std.testing.expectEqualSlices(u8, &.{ 127, 1, 0 }, (try mach.register(0, 1))[0..3]);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, try mach.register(0, 0));
+        try std.testing.expectEqualSlices(u8, rom_before, mach.rom.items);
+        try std.testing.expectEqual(host_end, mach.stack.items.len);
+        try std.testing.expectEqual(@as(usize, 1), mach.kstack.items.len);
+    }
+    try mach.popStack();
+    try std.testing.expectEqual(@as(usize, 0), mach.stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mach.kstack.items.len);
 }
 
-test "resolved locations handle nested calls and allocation failure cleanup" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, resolvedCallScenario, .{});
-}
-
-test "enter and return require no heap allocation when stack capacity is available" {
+test "all binary operations support aliased three byte registers" {
     var mach = try init(std.testing.allocator);
     defer mach.deinit();
-    try mach.pushStack(&.{1});
-    const block = try mach.pushBlock(&.{ .{ .tmp = .{5} }, .{ .ret = 0 } });
-    try mach.stack.ensureUnusedCapacity(mach.alloc, 64);
+    try mach.pushStack(&.{3});
+    const Case = struct { instruction: Inst, expected: u24 };
+    const operands: Inst.Lrd = .{ .l = 0, .r = 1, .d = 0 };
+    for ([_]Case{
+        .{ .instruction = .{ .add = operands }, .expected = 0x123456 + 4 },
+        .{ .instruction = .{ .sub = operands }, .expected = 0x123456 - 4 },
+        .{ .instruction = .{ .mul = operands }, .expected = 0x123456 * 4 },
+        .{ .instruction = .{ .div = operands }, .expected = 0x123456 / 4 },
+        .{ .instruction = .{ .mod = operands }, .expected = 0x123456 % 4 },
+        .{ .instruction = .{ .cmp = operands }, .expected = 1 },
+        .{ .instruction = .{ .band = operands }, .expected = 0x123456 & 4 },
+        .{ .instruction = .{ .bor = operands }, .expected = 0x123456 | 4 },
+        .{ .instruction = .{ .bxor = operands }, .expected = 0x123456 ^ 4 },
+        .{ .instruction = .{ .shl = operands }, .expected = 0x234560 },
+        .{ .instruction = .{ .shr = operands }, .expected = 0x012345 },
+    }) |case| {
+        const block = try mach.pushBlock(&.{
+            .{ .tmp = .{3} },
+            .{ .tmp = .{1} },
+            .{ .read = try mach.readFromRom(0, @as(u24, 0x123456)) },
+            .{ .read = try mach.readFromRom(1, @as(u8, 4)) },
+            case.instruction,
+            .{ .ret = 0 },
+        });
+        const end = try mach.extendStack(128);
+        mach.stack.shrinkRetainingCapacity(end);
+        try mach.kstack.ensureUnusedCapacity(mach.alloc, 1);
+        {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            mach.alloc = failing.allocator();
+            defer mach.alloc = std.testing.allocator;
+            try mach.run(.{ .call = .{ .id = block, .d = 0 } });
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+        try std.testing.expectEqual(case.expected, std.mem.readInt(u24, (try mach.register(0, 0))[0..3], .little));
+    }
+}
+
+test "division and remainder reconstruct a seventeen byte value" {
+    var mach = try init(std.testing.allocator);
+    defer mach.deinit();
+    try mach.pushStack(&.{17});
+    const value: u136 = (@as(u136, 1) << 128) + 5;
+    const encoded = try mach.pushRom(value);
+    const block = try mach.pushBlock(&.{
+        .{ .tmp = .{17} },
+        .{ .tmp = .{3} },
+        .{ .tmp = .{17} },
+        .{ .read = .{ .d = 0, .o = encoded, .s = 17 } },
+        .{ .read = try mach.readFromRom(1, @as(u24, 3)) },
+        .{ .mod = .{ .l = 0, .r = 1, .d = 2 } },
+        .{ .div = .{ .l = 0, .r = 1, .d = 0 } },
+        .{ .mul = .{ .l = 0, .r = 1, .d = 0 } },
+        .{ .add = .{ .l = 0, .r = 2, .d = 0 } },
+        .{ .ret = 0 },
+    });
+    try mach.run(.{ .call = .{ .id = block, .d = 0 } });
+    try std.testing.expectEqualSlices(u8, mach.rom.items[encoded..][0..17], try mach.register(0, 0));
+}
+
+test "lea and unary operations do not allocate with reserved runtime storage" {
+    var mach = try init(std.testing.allocator);
+    defer mach.deinit();
+    try mach.pushStack(&.{@sizeOf(usize)});
+    const block = try mach.pushBlock(&.{
+        .{ .tmp = .{@sizeOf(usize)} },
+        .{ .lea = .{ .l = 0, .d = 0 } },
+        .{ .nnot = .{ .l = 0, .d = 0 } },
+        .{ .not = .{ .l = 0, .d = 0 } },
+        .{ .bnot = .{ .l = 0, .d = 0 } },
+        .{ .ret = 0 },
+    });
+    const end = try mach.extendStack(128);
+    mach.stack.shrinkRetainingCapacity(end);
     try mach.kstack.ensureUnusedCapacity(mach.alloc, 1);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     mach.alloc = failing.allocator();
     defer mach.alloc = std.testing.allocator;
-    try mach.run(.{ .call = .{ .id = block, .d = 0, .args = &.{0} } });
+    try mach.run(.{ .call = .{ .id = block, .d = 0 } });
+    for (try mach.register(0, 0)) |byte| try std.testing.expectEqual(@as(u8, 255), byte);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+fn allocationScenario(allocator: std.mem.Allocator) !void {
+    var mach = try init(allocator);
+    defer mach.deinit();
+    try mach.pushStack(&.{3});
+    const block = try mach.pushBlock(&.{
+        .{ .tmp = .{3} },
+        .{ .tmp = .{1} },
+        .{ .read = try mach.readFromRom(0, @as(u24, 27)) },
+        .{ .read = try mach.readFromRom(1, @as(u8, 3)) },
+        .{ .div = .{ .l = 0, .r = 1, .d = 0 } },
+        .{ .ret = 0 },
+    });
+    try mach.run(.{ .call = try mach.makeCall(block, 0, &.{0}) });
+    try std.testing.expectEqualSlices(u8, &.{ 9, 0, 0 }, try mach.register(0, 0));
+}
+
+test "allocation failures leave no owned buffers or partial frames" {
+    for (0..128) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        allocationScenario(failing.allocator()) catch |err| {
+            if (err != error.OutOfMemory) return err;
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) return;
+    }
+    return error.IncompleteAllocationCoverage;
+}
+
+test "invalid arguments and division by zero unwind without changing ROM" {
+    var mach = try init(std.testing.allocator);
+    defer mach.deinit();
+    try mach.pushStack(&.{1});
+    const invalid = try mach.pushBlock(&.{ .{ .tmp = .{1} }, .{ .arg = .{ .i = 0, .d = 0 } }, .{ .ret = 0 } });
+    const zero = try mach.pushBlock(&.{
+        .{ .tmp = .{1} },
+        .{ .div = .{ .l = 0, .r = 0, .d = 0 } },
+        .{ .ret = 0 },
+    });
+    const stackend = mach.stack.items.len;
+    const romend = mach.rom.items.len;
+    try std.testing.expectError(error.InvalidArgument, mach.run(.{ .call = .{ .id = invalid, .d = 0 } }));
+    try std.testing.expectError(error.DivisionByZero, mach.run(.{ .call = .{ .id = zero, .d = 0 } }));
+    try std.testing.expectEqual(stackend, mach.stack.items.len);
+    try std.testing.expectEqual(romend, mach.rom.items.len);
     try std.testing.expectEqual(@as(usize, 1), mach.kstack.items.len);
-    try std.testing.expectEqualSlices(u8, &.{0}, mach.stack.items);
 }

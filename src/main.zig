@@ -16,16 +16,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .jmp3 = .{ .r = 2, .more = 6, .less = 9, .equal = 9 } },
         .{ .read = try mach.readFromRom(1, @as(u8, 1)) },
         .{ .sub = .{ .l = 0, .r = 1, .d = 0 } },
-        .{ .call = .{ .id = 0, .d = 0, .args = &.{0} } },
+        .{ .call = try mach.makeCall(0, 0, &.{0}) },
         .{ .ret = 0 },
     });
     const entry = try mach.pushBlock(&.{
         .{ .tmp = .{@sizeOf(u32)} },
         .{ .read = try mach.readFromRom(0, @as(u32, 5_000_000)) },
-        .{ .call = .{ .id = recurse, .d = 0, .args = &.{0} } },
+        .{ .call = try mach.makeCall(recurse, 0, &.{0}) },
         .{ .ret = 0 },
     });
     try mach.pushStack(&.{@sizeOf(u32)});
     try mach.run(.{ .call = .{ .id = entry, .d = 0 } });
-    println("{x}", .{mach.stack.items});
+    println("{x}", .{try mach.register(0, 0)});
 }
