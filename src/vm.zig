@@ -3,6 +3,7 @@ const Math = @import("math.zig");
 pub const Reg = u32;
 pub const Mach = @This();
 
+pub const Extension = *const fn (args: []const []u8) anyerror!void;
 const Slot = extern struct { offset: usize, len: usize };
 const Block = struct {
     offset: usize,
@@ -19,11 +20,12 @@ const Frame = struct {
 };
 
 alloc: std.mem.Allocator,
+extensions: std.ArrayList(Extension) = .empty,
 rom: std.ArrayList(u8) = .empty,
 instructions: std.ArrayList(Inst) = .empty,
 blocks: std.ArrayList(Block) = .empty,
 slots: std.ArrayList(Slot) = .empty,
-stack: std.ArrayList(u8) = .empty,
+stack: std.array_list.Aligned(u8, .of([]u8)) = .empty,
 kstack: std.ArrayList(Frame) = .empty,
 
 pub const Inst = union(enum) {
@@ -40,6 +42,7 @@ pub const Inst = union(enum) {
 
     arg: struct { i: u32, d: Reg },
     call: struct { id: u32, d: Reg, args: usize = 0, argcount: u32 = 0 },
+    callEx: struct { id: u32, args: usize = 0, argcount: u32 = 0 },
     ret: Reg,
 
     cpy: Ld,
@@ -75,7 +78,14 @@ pub fn init(alloc: std.mem.Allocator) !Mach {
     return .{ .alloc = alloc };
 }
 
+pub fn registerExtension(this: *Mach, function: Extension) !u32 {
+    const id = std.math.cast(u32, this.extensions.items.len) orelse return error.TooManyExtensions;
+    try this.extensions.append(this.alloc, function);
+    return id;
+}
+
 pub fn deinit(this: *Mach) void {
+    this.extensions.deinit(this.alloc);
     this.rom.deinit(this.alloc);
     this.instructions.deinit(this.alloc);
     this.blocks.deinit(this.alloc);
@@ -175,7 +185,7 @@ pub fn readFromRom(this: *Mach, dest: Reg, value: anytype) !@FieldType(Inst, "re
     return .{ .s = (@bitSizeOf(@TypeOf(value)) + 7) / 8, .o = try this.pushRom(value), .d = dest };
 }
 
-pub fn makeCall(this: *Mach, id: u32, dest: Reg, args: []const Reg) !@FieldType(Inst, "call") {
+fn pushArgs(this: *Mach, args: []const Reg) !struct { offset: usize, count: u32 } {
     const count = std.math.cast(u32, args.len) orelse return error.TooManyArguments;
     const bytes = try std.math.mul(usize, args.len, @sizeOf(Reg));
     const offset = this.rom.items.len;
@@ -183,7 +193,17 @@ pub fn makeCall(this: *Mach, id: u32, dest: Reg, args: []const Reg) !@FieldType(
     for (args, 0..) |arg, i| {
         std.mem.writeInt(Reg, this.rom.items[offset + i * @sizeOf(Reg) ..][0..@sizeOf(Reg)], arg, .little);
     }
-    return .{ .id = id, .d = dest, .args = offset, .argcount = count };
+    return .{ .offset = offset, .count = count };
+}
+
+pub fn makeCall(this: *Mach, id: u32, dest: Reg, args: []const Reg) !@FieldType(Inst, "call") {
+    const stored = try this.pushArgs(args);
+    return .{ .id = id, .d = dest, .args = stored.offset, .argcount = stored.count };
+}
+
+pub fn makeCallEx(this: *Mach, id: u32, args: []const Reg) !@FieldType(Inst, "callEx") {
+    const stored = try this.pushArgs(args);
+    return .{ .id = id, .args = stored.offset, .argcount = stored.count };
 }
 
 fn resolve(this: *Mach, frame: Frame, reg: Reg) !Slot {
@@ -227,7 +247,7 @@ fn enter(this: *Mach, call: @FieldType(Inst, "call")) !void {
 }
 
 pub fn run(this: *Mach, entry: Inst) !void {
-    if (entry != .call) return error.InvalidEntry;
+    if (entry != .call and entry != .callEx) return error.InvalidEntry;
     const parent = this.kstack.getLastOrNull() orelse return error.NoCallerFrame;
     if (parent.block != null) return error.ActiveCall;
     const depth = this.kstack.items.len;
@@ -235,6 +255,10 @@ pub fn run(this: *Mach, entry: Inst) !void {
     defer {
         this.kstack.shrinkRetainingCapacity(depth);
         this.stack.shrinkRetainingCapacity(stackend);
+    }
+    if (entry == .callEx) {
+        try this.dispatchExtension(depth - 1, entry.callEx);
+        return;
     }
     try this.enter(entry.call);
     while (this.kstack.items.len > depth) {
@@ -257,6 +281,7 @@ pub fn run(this: *Mach, entry: Inst) !void {
                 Math.copy(try this.register(fi, a.d), this.location(frame.callargs[index]));
             },
             .call => |c| try this.enter(c),
+            .callEx => |b| try this.dispatchExtension(fi, b),
             .ret => |r| {
                 Math.copy(this.location(frame.callargs[0]), try this.register(fi, r));
                 const base = frame.base;
@@ -299,6 +324,32 @@ pub fn run(this: *Mach, entry: Inst) !void {
             },
         }
     }
+}
+
+fn dispatchExtension(this: *Mach, fi: usize, args: @FieldType(Inst, "callEx")) !void {
+    if (args.id >= this.extensions.items.len) return error.InvalidExtension;
+    try this.invokeExtension(fi, args, this.extensions.items[args.id]);
+}
+
+fn invokeExtension(this: *Mach, fi: usize, args: @FieldType(Inst, "callEx"), callback: Extension) !void {
+    const encoded_len = try std.math.mul(usize, args.argcount, @sizeOf(Reg));
+    const encoded_end = try std.math.add(usize, args.args, encoded_len);
+    if (encoded_end > this.rom.items.len) return error.InvalidRom;
+    // Reserve all slice headers before borrowing register data. The stack has
+    // slice alignment, and padding keeps the headers aligned within it.
+    const end = this.stack.items.len;
+    const alignment: usize = @alignOf([]u8);
+    const aligned = (try std.math.add(usize, end, alignment - 1)) & ~(alignment - 1);
+    const bytes = try std.math.mul(usize, args.argcount, @sizeOf([]u8));
+    _ = try this.extendStack(try std.math.add(usize, aligned - end, bytes));
+    defer this.stack.shrinkRetainingCapacity(end);
+    const headers: []align(@alignOf([]u8)) u8 = @alignCast(this.stack.items[aligned..][0..bytes]);
+    const registers = std.mem.bytesAsSlice([]u8, headers);
+    for (registers, 0..) |*value, i| {
+        const encoded = this.rom.items[args.args + i * @sizeOf(Reg) ..][0..@sizeOf(Reg)];
+        value.* = try this.register(fi, std.mem.readInt(Reg, encoded, .little));
+    }
+    try callback(registers);
 }
 
 fn binary(this: *Mach, fi: usize, a: Inst.Lrd, comptime op: std.meta.Tag(Inst)) !void {
@@ -492,4 +543,75 @@ test "invalid arguments and division by zero unwind without changing ROM" {
     try std.testing.expectEqual(stackend, mach.stack.items.len);
     try std.testing.expectEqual(romend, mach.rom.items.len);
     try std.testing.expectEqual(@as(usize, 1), mach.kstack.items.len);
+}
+
+test "VM owned function lists provide floating point extensions" {
+    const Callbacks = struct {
+        fn addFloat(args: []const []u8) !void {
+            if (args.len != 3) return error.InvalidArguments;
+            for (args) |value| if (value.len != 4) return error.InvalidArguments;
+            const left: f32 = @bitCast(std.mem.readInt(u32, args[1][0..4], .little));
+            const right: f32 = @bitCast(std.mem.readInt(u32, args[2][0..4], .little));
+            std.mem.writeInt(u32, args[0][0..4], @bitCast(left + right), .little);
+        }
+    };
+    for (0..2) |_| {
+        var mach = try init(std.testing.allocator);
+        defer mach.deinit();
+        const id = try mach.registerExtension(Callbacks.addFloat);
+        try mach.pushStack(&.{4});
+        const block = try mach.pushBlock(&.{
+            .{ .tmp = .{4} },
+            .{ .tmp = .{4} },
+            .{ .read = try mach.readFromRom(0, @as(u32, @bitCast(@as(f32, 1.5)))) },
+            .{ .read = try mach.readFromRom(1, @as(u32, @bitCast(@as(f32, 2.25)))) },
+            .{ .callEx = try mach.makeCallEx(id, &.{ 0, 0, 1 }) },
+            .{ .ret = 0 },
+        });
+        const end = try mach.extendStack(256);
+        mach.stack.shrinkRetainingCapacity(end);
+        try mach.kstack.ensureUnusedCapacity(mach.alloc, 1);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        mach.alloc = failing.allocator();
+        defer mach.alloc = std.testing.allocator;
+        try mach.run(.{ .call = .{ .id = block, .d = 0 } });
+        const actual: f32 = @bitCast(std.mem.readInt(u32, (try mach.register(0, 0))[0..4], .little));
+        try std.testing.expectEqual(@as(f32, 3.75), actual);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+}
+
+test "builtin errors unwind and argument validation prevents invocation" {
+    const Callbacks = struct {
+        fn fail(_: []const []u8) !void {
+            return error.ExtensionFailure;
+        }
+        fn noArguments(args: []const []u8) !void {
+            try std.testing.expectEqual(@as(usize, 0), args.len);
+        }
+    };
+    var mach = try init(std.testing.allocator);
+    defer mach.deinit();
+    const fail_id = try mach.registerExtension(Callbacks.fail);
+    const empty_id = try mach.registerExtension(Callbacks.noArguments);
+    try mach.pushStack(&.{1});
+    const block = try mach.pushBlock(&.{
+        .{ .tmp = .{1} },
+        .{ .callEx = try mach.makeCallEx(fail_id, &.{0}) },
+        .{ .ret = 0 },
+    });
+    const end = mach.stack.items.len;
+    const rom_len = mach.rom.items.len;
+    try std.testing.expectError(error.ExtensionFailure, mach.run(.{ .call = .{ .id = block, .d = 0 } }));
+    try std.testing.expectEqual(end, mach.stack.items.len);
+    try std.testing.expectEqual(@as(usize, 1), mach.kstack.items.len);
+    try std.testing.expectEqual(rom_len, mach.rom.items.len);
+    try std.testing.expectError(error.InvalidExtension, mach.run(.{ .callEx = .{ .id = 999 } }));
+    try std.testing.expectError(error.InvalidRegister, mach.run(.{ .callEx = try mach.makeCallEx(fail_id, &.{99}) }));
+    try std.testing.expectError(error.InvalidRom, mach.run(.{ .callEx = .{ .id = fail_id, .args = mach.rom.items.len, .argcount = 1 } }));
+    try mach.run(.{ .callEx = try mach.makeCallEx(empty_id, &.{}) });
+    var other = try init(std.testing.allocator);
+    defer other.deinit();
+    try other.pushStack(&.{1});
+    try std.testing.expectError(error.InvalidExtension, other.run(.{ .callEx = .{ .id = empty_id } }));
 }
