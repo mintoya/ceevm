@@ -9,6 +9,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "bitint.c",
+        "bitint.h",
         "README.md",
         "LICENSE",
     },
