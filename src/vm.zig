@@ -3,40 +3,69 @@ const CBitInt = @import("bitint");
 pub const BitInt = struct {
     pub const BitBuf = CBitInt.BitBuf;
     pub fn add(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) void {
-        CBitInt.eval_bitint_add(@intCast(bits), l, r);
+        CBitInt.eval_bitint_add(@intCast(bits), @constCast(l), r);
     }
     pub fn sub(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) void {
-        CBitInt.eval_bitint_sub(@intCast(bits), l, r);
+        CBitInt.eval_bitint_sub(@intCast(bits), @constCast(l), r);
     }
     pub fn mul(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) void {
-        CBitInt.eval_bitint_mul(@intCast(bits), l, r);
+        CBitInt.eval_bitint_mul(@intCast(bits), @constCast(l), r);
     }
-    pub fn div(bits: u32, l: [*]BitBuf, r: [*]BitBuf) void {
-        CBitInt.eval_bitint_div(@intCast(bits), l, r, true, true);
+    pub fn div(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) void {
+        CBitInt.eval_bitint_div(@intCast(bits), @constCast(l), r, true, true);
     }
-    pub fn mod(bits: u32, l: [*]BitBuf, r: [*]BitBuf) void {
-        CBitInt.eval_bitint_div(@intCast(bits), l, r, true, false);
+    pub fn mod(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) void {
+        CBitInt.eval_bitint_div(@intCast(bits), @constCast(l), r, true, false);
     }
-    // cmp: Lrd, //    <=>
-    // not: Ld, //     !
-    // nnot: Ld, //    !!
-    // bnot: Ld, //    ~
+    pub fn cmp(bits: u32, l: [*]const BitBuf, r: [*]BitBuf) i32 {
+        return @intCast(CBitInt.eval_bitint_cmp(bits, l, r, true));
+    }
+    pub const BitBufBits = @sizeOf(BitBuf) * 8;
+    pub fn nnot(bits: u32, l: [*]const BitBuf) bool {
+        for (l, 0..(bits / BitBufBits)) |v, _|
+            if (v.as64 != 0) return true;
+        const mask = (@as(u64, 1) << @intCast(bits % BitBufBits + 1)) - 1;
+        if (mask != 0) if (mask & l[bits / BitBufBits].as64 != 0) return true;
+        return false;
+    }
+    pub fn not(bits: u32, l: [*]const BitBuf) bool {
+        return !nnot(bits, l);
+    }
+    pub fn bnot(bits: u32, l: [*]BitBuf) void {
+        for (0..(bits / BitBufBits)) |i|
+            l[i].as64 = ~l[i].as64;
+        if (bits % BitBufBits != 0)
+            l[bits / BitBufBits].as64 = ~l[bits / BitBufBits].as64;
+    }
+    // shl: Lrd, //    <<
+    // shr: Lrd, //    >>
     // band: Lrd, //   &
     // bor: Lrd, //    |
     // bxor: Lrd, //   ^
-    // shl: Lrd, //    <<
-    // shr: Lrd, //    >>
 };
 test "div and mod" {
     var a = [_]BitInt.BitBuf{.{ .as64 = 67 }};
     var b = [_]BitInt.BitBuf{.{ .as64 = 60 }};
-    BitInt.div(8, &a, &b);
+    BitInt.div(9, &a, &b);
     try std.testing.expectEqual(@as(u64, 1), b[0].as64);
 
     a[0] = .{ .as64 = 67 };
     b[0] = .{ .as64 = 60 };
     BitInt.mod(8, &a, &b);
     try std.testing.expectEqual(@as(u64, 7), b[0].as64);
+}
+test "not and nnot" {
+    var a = [_]BitInt.BitBuf{.{ .as64 = 0b1000000000 }};
+    try std.testing.expectEqual(BitInt.not(9, &a), false);
+    try std.testing.expectEqual(BitInt.nnot(9, &a), true);
+    a[0] = .{ .as64 = 0b1 };
+    try std.testing.expectEqual(BitInt.not(1, &a), false);
+    try std.testing.expectEqual(BitInt.nnot(1, &a), true);
+}
+test "bnot" {
+    var a = [_]BitInt.BitBuf{.{ .as64 = 0b1000000000 }};
+    BitInt.bnot(9, &a);
+    try std.testing.expectEqual(0b0111111111, a[0].as64 & (@as(u64, 1 << 9) - 1));
 }
 const std = @import("std");
 const List = std.ArrayList;
