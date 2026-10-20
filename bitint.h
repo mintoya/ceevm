@@ -1,5 +1,6 @@
 #ifndef CEEVM_BITINT_H
 #define CEEVM_BITINT_H
+#include "u8slice.h"
 
 #include <stdint.h>
 #include <stdbool.h>

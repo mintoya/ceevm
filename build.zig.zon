@@ -11,6 +11,7 @@
         "src",
         "bitint.c",
         "bitint.h",
+        "u8slice.h",
         "README.md",
         "LICENSE",
     },

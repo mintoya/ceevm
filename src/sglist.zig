@@ -29,7 +29,9 @@ pub fn SgList(T: type) type {
             std.debug.assert(index < self.len);
             return &self.arrays[idx1(index)].?[idx2(index)];
         }
-
+        pub fn append(self: *Self, allocator: std.mem.Allocator, value: T) !void {
+            try self.push(allocator, value);
+        }
         pub fn push(self: *Self, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!void {
             if (self.len > std.math.maxInt(usize) - 8) return error.OutOfMemory;
             const section = idx1(self.len);
@@ -41,6 +43,9 @@ pub fn SgList(T: type) type {
             }
             self.arrays[section].?[idx2(self.len)] = value;
             self.len += 1;
+        }
+        pub fn appendNTimes(self: *Self, allocator: std.mem.Allocator, it: T, N: usize) !void {
+            for (0..N) |_| try self.push(allocator, it);
         }
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             for (&self.arrays, 0..) |*array, section| {
