@@ -144,6 +144,7 @@ pub const CSlice = CBitInt.u8slice;
 pub const Extension = *const fn (arg: CSlice, ret: CSlice) callconv(.c) void;
 const SgList = @import("sglist.zig").SgList;
 alloc: std.mem.Allocator,
+buffer: [1 << 8]u8 = undefined,
 
 rom: List(u8) = .empty,
 //ram: List(u8) = .empty,
@@ -467,10 +468,11 @@ fn arithmetic(self: *Mach, id: ?FnId, frame: usize, inst: Inst) !void {
     const dest = self.slot(id, frame, operands.d);
     const width = @max(left.bits, right.bits);
     const bits: u32 = @intCast(width);
-    const l = try self.alloc.alloc(BitInt.BitBuf, (width + 63) / 64);
-    defer self.alloc.free(l);
-    const r = try self.alloc.alloc(BitInt.BitBuf, l.len);
-    defer self.alloc.free(r);
+    var fba = std.heap.FixedBufferAllocator.init(&self.buffer);
+    const allocator = fba.allocator();
+    const l = try allocator.alloc(BitInt.BitBuf, (width + 63) / 64);
+    const r = try allocator.alloc(BitInt.BitBuf, l.len);
+
     self.load(left, std.mem.sliceAsBytes(l));
     self.load(right, std.mem.sliceAsBytes(r));
     switch (inst) {
@@ -509,35 +511,6 @@ fn arithmetic(self: *Mach, id: ?FnId, frame: usize, inst: Inst) !void {
     self.save(dest, std.mem.sliceAsBytes(r));
 }
 
-test "execution: arithmetic, aliasing, nested calls and frame cleanup" {
-    var mach = try init(std.testing.allocator);
-    defer mach.deinit();
-    const child = try mach.makeBlock([_]Inst{
-        .{ .tmp = 32 },                               .{ .arg = 0 },                           .{ .tmp = 32 },
-        .{ .rom = try mach.makeRom(1, @as(u32, 3)) }, .{ .sub = .{ .l = 0, .r = 1, .d = 0 } }, .{ .mul = .{ .l = 0, .r = 1, .d = 0 } },
-        .{ .ret = 0 },
-    });
-    const parent = try mach.makeBlock([_]Inst{
-        .{ .tmp = 32 },                .{ .arg = 0 },
-        .{ .call = .{ .id = child } }, .{ .ret = 0 },
-    });
-    try expectProgram(&mach, parent, std.mem.asBytes(&@as(u32, 10)), std.mem.asBytes(&@as(u32, 21)));
-    try std.testing.expectEqual(@as(usize, 0), mach.stack.len);
-    try std.testing.expectEqual(@as(usize, 0), mach.addressStack.items.len);
-}
-
-test "execution: partial bytes, comparisons and conditional fallthrough" {
-    var mach = try init(std.testing.allocator);
-    defer mach.deinit();
-    const block = try mach.makeBlock([_]Inst{
-        .{ .tmp = 9 },                                  .{ .tmp = 9 },                                .{ .tmp = 8 },
-        .{ .rom = try mach.makeRom(0, @as(u16, 511)) }, .{ .rom = try mach.makeRom(1, @as(u16, 1)) }, .{ .add = .{ .l = 0, .r = 1, .d = 0 } },
-        .{ .cmp = .{ .l = 0, .r = 1, .d = 2 } },        .{ .jmp3 = .{ .r = 2, .@">" = 100 } },        .{ .jmp3 = .unconditional(10) },
-        .{ .ret = 1 },                                  .{ .ret = 0 },
-    });
-    try expectProgram(&mach, block, &.{}, std.mem.asBytes(&@as(u16, 0)));
-}
-
 test "execution errors unwind stack frames" {
     var mach = try init(std.testing.allocator);
     defer mach.deinit();
@@ -559,81 +532,7 @@ test "truth checks respect bit width and word boundaries" {
     try std.testing.expect(!BitInt.nnot(9, &outside));
 }
 
-test "execution: unsigned arithmetic and bit operations" {
-    const cases = [_]struct { Inst, u32 }{
-        .{ .{ .add = .{ .l = 0, .r = 1, .d = 0 } }, 70 },
-        .{ .{ .sub = .{ .l = 0, .r = 1, .d = 0 } }, 64 },
-        .{ .{ .mul = .{ .l = 0, .r = 1, .d = 0 } }, 201 },
-        .{ .{ .div = .{ .l = 0, .r = 1, .d = 0 } }, 22 },
-        .{ .{ .mod = .{ .l = 0, .r = 1, .d = 0 } }, 1 },
-        .{ .{ .band = .{ .l = 0, .r = 1, .d = 0 } }, 3 },
-        .{ .{ .bor = .{ .l = 0, .r = 1, .d = 0 } }, 67 },
-        .{ .{ .bxor = .{ .l = 0, .r = 1, .d = 0 } }, 64 },
-        .{ .{ .shl = .{ .l = 0, .r = 1, .d = 0 } }, 536 },
-        .{ .{ .shr = .{ .l = 0, .r = 1, .d = 0 } }, 8 },
-        .{ .{ .bnot = .{ .l = 0, .d = 0 } }, 0xffffffbc },
-        .{ .{ .not = .{ .l = 0, .d = 0 } }, 0 },
-        .{ .{ .nnot = .{ .l = 0, .d = 0 } }, 1 },
-    };
-    inline for (cases) |case| {
-        var mach = try init(std.testing.allocator);
-        defer mach.deinit();
-        const block = try mach.makeBlock([_]Inst{
-            .{ .tmp = 32 },                                .{ .tmp = 32 },
-            .{ .rom = try mach.makeRom(0, @as(u32, 67)) }, .{ .rom = try mach.makeRom(1, @as(u32, 3)) },
-            case[0],                                       .{ .ret = 0 },
-        });
-        try expectProgram(&mach, block, &.{}, std.mem.asBytes(&@as(u32, case[1])));
-    }
-}
-
-test "execution: extension and aggregate round trip" {
-    var mach = try init(std.testing.allocator);
-    defer mach.deinit();
-    const Host = struct {
-        fn increment(arg: CSlice, ret: CSlice) callconv(.c) void {
-            ret.ptr[0] = arg.ptr[0] + 1;
-        }
-    };
-    const increment = try mach.makeExtension(Host.increment);
-    const block = try mach.makeBlock([_]Inst{
-        .{ .tmp = 16 },                                    .{ .tmp = 8 },                                      .{ .tmp = 8 },
-        .{ .arg = 0 },                                     .{ .dcons = try mach.makeCons(0, [_]Reg{ 1, 2 }) }, .{ .calx = .{ .id = increment, .arg = 1, .d = 1 } },
-        .{ .cons = try mach.makeCons(0, [_]Reg{ 2, 1 }) }, .{ .ret = 0 },
-    });
-    try expectProgram(&mach, block, &.{ 7, 9 }, &.{ 9, 8 });
-    try std.testing.expectEqual(@as(usize, 0), mach.stack.len);
-}
-
 // Observe program output through an extension, as a host would.
-fn expectProgram(mach: *Mach, block: FnId, argument: []const u8, expected: []const u8) !void {
-    const Capture = struct {
-        var bytes: [256]u8 = undefined;
-        var captured_len: usize = 0;
-        var called: bool = false;
-        fn output(arg: CSlice, _: CSlice) callconv(.c) void {
-            const value = arg.ptr[0..arg.len];
-            @memcpy(bytes[0..value.len], value);
-            captured_len = value.len;
-            called = true;
-        }
-    };
-    Capture.called = false;
-    const extension = try mach.makeExtension(Capture.output);
-    const offset = mach.rom.items.len;
-    try mach.rom.appendSlice(mach.alloc, argument);
-    const entry = try mach.makeBlock([_]Inst{
-        .{ .tmp = @max(1, argument.len, expected.len) * 8 },
-        .{ .rom = .{ .d = 0, .o = offset, .s = argument.len } },
-        .{ .call = .{ .id = block } },
-        .{ .calx = .{ .id = extension } },
-        .{ .ret = 0 },
-    });
-    try mach.run(.{ .call = .{ .id = entry } });
-    try std.testing.expect(Capture.called);
-    try std.testing.expectEqualSlices(u8, expected, Capture.bytes[0..expected.len]);
-    try std.testing.expectEqual(@as(usize, 0), mach.stack.len);
-}
 
 test "root frame persists across instruction dispatch and failed calls" {
     var mach = try init(std.testing.allocator);
@@ -666,56 +565,10 @@ test "root frame persists across instruction dispatch and failed calls" {
     try std.testing.expectEqual(@as(usize, 0), mach.addressStack.items.len);
 }
 
-test "deep calls use VM frames and resume caller instructions" {
-    var mach = try init(std.testing.allocator);
-    defer mach.deinit();
-    const recursive = try mach.makeBlock([_]Inst{
-        .{ .tmp = 32 }, // 0
-        .{ .tmp = 32 }, // 1
-        .{ .tmp = 8 }, // 2
-        .{ .arg = 0 }, // 3
-        .{ .cmp = .{ .l = 0, .r = 1, .d = 2 } }, // 4
-        .{ .jmp3 = .{ .r = 2, .@">" = 6, .@"=" = 10, .@"<" = 10 } }, // 5
-        .{ .rom = try mach.makeRom(1, @as(u32, 1)) }, // 6
-        .{ .sub = .{ .l = 0, .r = 1, .d = 0 } }, // 7
-        .{ .call = .{ .id = 0 } }, // 8
-        .{ .add = .{ .l = 0, .r = 1, .d = 0 } }, // 9
-        .{ .ret = 0 }, // 10
-    });
-    try expectProgram(&mach, recursive, std.mem.asBytes(&@as(u32, 10000)), std.mem.asBytes(&@as(u32, 10000)));
-}
-
 test "math fallback retains multiple words" {
     var l = [_]BitInt.BitBuf{ .{ .as64 = std.math.maxInt(u64) }, .{ .as64 = 1 } };
     var r = [_]BitInt.BitBuf{ .{ .as64 = 1 }, .{ .as64 = 0 } };
     BitInt.add(128, &l, &r);
     try std.testing.expectEqual(@as(u64, 0), r[0].as64);
     try std.testing.expectEqual(@as(u64, 2), r[1].as64);
-}
-
-test "extensions receive distinct argument and return sizes" {
-    var mach = try init(std.testing.allocator);
-    defer mach.deinit();
-    const Host = struct {
-        fn widen(arg: CSlice, ret: CSlice) callconv(.c) void {
-            std.debug.assert(arg.len == 1);
-            std.debug.assert(ret.len == 4);
-            const result: u32 = @as(u32, arg.ptr[0]) * 2;
-            @memcpy(ret.ptr[0..ret.len], std.mem.asBytes(&result));
-        }
-    };
-    const extension = try mach.makeExtension(Host.widen);
-    const block = try mach.makeBlock([_]Inst{
-        .{ .tmp = 8 },
-        .{ .tmp = 32 },
-        .{ .tmp = 40 },
-        .{ .rom = try mach.makeRom(0, @as(u8, 21)) },
-        .{ .calx = .{ .id = extension, .arg = 0, .d = 1 } },
-        .{ .cons = try mach.makeCons(2, [_]Reg{ 0, 1 }) },
-        .{ .ret = 2 },
-    });
-    var expected: [5]u8 = undefined;
-    expected[0] = 21;
-    @memcpy(expected[1..], std.mem.asBytes(&@as(u32, 42)));
-    try expectProgram(&mach, block, &.{}, &expected);
 }

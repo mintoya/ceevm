@@ -1,9 +1,14 @@
 #ifndef CEEVM_BITINT_H
 #define CEEVM_BITINT_H
-#include "u8slice.h"
-
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef struct u8slice u8slice;
+struct u8slice {
+  size_t len;
+  unsigned char *ptr;
+};
+
 typedef union {
   uint64_t as64;
   uint32_t as32;
