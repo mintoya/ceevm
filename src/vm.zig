@@ -113,7 +113,7 @@ stack: SgList(u8) = .empty,
 blocks: List(struct {
     items: []const struct {
         offset: usize,
-        length: usize,
+        bits: usize,
     },
     instructions: []const Inst,
 }) = .empty,
@@ -127,11 +127,7 @@ pub const FnId = u32;
 pub const Inst = union(enum) {
     pub const Lrd = struct { l: Reg, r: Reg, d: Reg };
     pub const Ld = struct { l: Reg, d: Reg };
-    pub const Cmp = enum(u8) {
-        less = 0xff,
-        more = 0x01,
-        eqal = 0x00,
-    };
+    pub const Cmp = enum(u8) { @"<" = 0xff, @">" = 0x01, @"=" = 0x00 };
     const Call = struct { id: FnId, d: Reg = 0, arg: Reg = 0 };
     const Construct = struct {
         d: Reg,
@@ -170,9 +166,9 @@ pub const Inst = union(enum) {
 
     jmp3: struct {
         r: ?Reg = null, // assumes register is result of a cmp, only checks for more and equal
-        more: u32,
-        less: u32 = 0,
-        equal: u32 = 0,
+        @">": u32,
+        @"<": u32 = 0,
+        @"=": u32 = 0,
     },
 };
 pub fn init(alloc: std.mem.Allocator) !Mach {
@@ -211,26 +207,27 @@ pub fn makeCons(self: *Mach, into: Reg, value: anytype) !@FieldType(Inst, "cons"
     try self.rom.appendSlice(self.alloc, std.mem.asBytes(&value));
     return result;
 }
+fn lineup(a: usize, u: usize) usize {
+    return (a + u - 1) / u * u;
+}
 pub fn makeBlock(self: *Mach, instructions: anytype) !FnId {
-    const it = @TypeOf(instructions);
-    ct_assert(@typeInfo(it) == .array, "expected array");
-    ct_assert(@typeInfo(it).array.child == Inst, "expected array of instructions");
+    const ists = @as([@typeInfo(@TypeOf(instructions)).array.len]Inst, instructions);
     const id = std.math.cast(FnId, self.blocks.items.len) orelse return error.TooManyBlocks;
     const Block = @TypeOf(self.blocks.items[0]);
     const Item = @typeInfo(@FieldType(Block, "items")).pointer.child;
     var items: List(Item) = .empty;
     defer items.deinit(self.alloc);
     var offset: usize = 0;
-    for (instructions) |inst| {
-        switch (inst) {
-            .tmp => |length| {
-                const end = try std.math.add(usize, offset, length);
-                try items.append(self.alloc, .{ .offset = offset, .length = length });
-                offset = end;
-            },
-            else => {},
-        }
-    }
+    for (ists) |inst| switch (inst) {
+        .tmp => |length| {
+            std.debug.assert(length > 0);
+            const len = lineup(8, length) / 8;
+            const end = try std.math.add(usize, offset, len);
+            try items.append(self.alloc, .{ .offset = offset, .bits = length });
+            offset = end;
+        },
+        else => {},
+    };
     const owned_items = try items.toOwnedSlice(self.alloc);
     errdefer self.alloc.free(owned_items);
     const owned_instructions = try self.alloc.dupe(Inst, &instructions);
@@ -241,4 +238,3 @@ pub fn makeBlock(self: *Mach, instructions: anytype) !FnId {
     });
     return id;
 }
-
